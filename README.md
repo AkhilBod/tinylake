@@ -7,7 +7,7 @@ and file skipping.
 I built it to figure out how Delta tables pull off transactions when Parquet
 files can't even be edited. It's about 840 lines with tests and benchmark, and
 it only needs `pyarrow` and `numpy`. Longer write-up:
-[Two writers, one table, no locks](https://akhilbod.github.io/writing/tinylake.html).
+[The bug that sent me building a tiny data lake](https://akhilbod.github.io/writing/tinylake.html).
 
 ## Try it
 
