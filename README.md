@@ -1,14 +1,15 @@
 # tinylake
 
-A small table format on top of Parquet files, in the style of Delta Lake. It
-gives a directory of Parquet files ACID commits, concurrent writers, time
-travel, compaction, Z-ordering, and min/max data skipping.
+A tiny Delta Lake clone in Python. Point it at a folder and you get a table of
+Parquet files with commits, multiple writers, time travel, compaction, Z-order
+and file skipping.
 
-It is about 840 lines of Python (library, tests and benchmark) on top of
-`pyarrow` and `numpy`. It exists to understand how a lakehouse table works
-underneath, so it favors code you can read in one sitting over features.
+I built it to figure out how Delta tables pull off transactions when Parquet
+files can't even be edited. It's about 840 lines with tests and benchmark, and
+it only needs `pyarrow` and `numpy`. Longer write-up:
+[Two writers, one table, no locks](https://akhilbod.github.io/writing/tinylake.html).
 
-## Quick start
+## Try it
 
 ```
 pip install -e ".[test]"
@@ -25,7 +26,7 @@ t.delete([("tag", "==", "b")])
 t.optimize(zorder_by=["id", "x"])
 
 t.read([("x", ">=", 1.0)])           # latest version
-t.read(version=1)                     # time travel
+t.read(version=1)                     # what it looked like after the first append
 rows, stats = t.scan([("id", "<", 2)])
 print(stats)                          # {'files_read': 1, 'files_skipped': 0}
 t.history()                           # CREATE, APPEND, DELETE, OPTIMIZE
@@ -33,81 +34,72 @@ t.history()                           # CREATE, APPEND, DELETE, OPTIMIZE
 
 ## How it works
 
-### The log (`tinylake/log.py`, `tinylake/snapshot.py`)
+### The log (`log.py`, `snapshot.py`)
 
-A table is a directory of Parquet files plus `_log/`. Version N is the commit
-file `_log/000...N.json`, one JSON action per line:
+Next to the data files there's a `_log/` folder. Each commit is one numbered
+JSON file, one action per line:
 
 - `metaData`: the schema
-- `add`: a data file, with its row count and per-column min/max
-- `remove`: a data file that is no longer part of the table
-- `commitInfo`: operation name, the version the writer read, a timestamp
+- `add`: a new data file, with row count and min/max for every column
+- `remove`: a file that's no longer part of the table
+- `commitInfo`: what ran, which version it read, when
 
-The live files at version N are whatever replaying commits 0..N leaves
-behind. Data files are never modified. A delete writes new files and
-removes old ones in the same commit, which is what makes time travel free:
-reading an old version means replaying fewer commits.
+To get version N, replay commits 0 to N and keep whatever files are left.
+Data files never change after they're written. A delete writes new files and
+removes the old ones in a single commit, and the old files stay on disk until
+`vacuum()`, which is why old versions are still readable.
 
-Every 10 commits a writer also saves a checkpoint, the full file list at that
-version, so loading a snapshot replays at most 9 commits after the newest
-checkpoint. Checkpoints are only a cache. Deleting them gives the same
-snapshot (there is a test for that).
+Every 10th commit also writes a checkpoint with the full file list, so loading
+a snapshot replays 9 commits at most. Checkpoints are only a cache. A test
+deletes them and checks the replayed table matches.
 
-The one thing the log needs from storage is "create this file only if it
-does not exist yet". On a local filesystem that is a write to a temp file
-followed by `os.link()`, which fails if the target exists. Readers never see
-a half-written commit, and of two writers racing for version N, exactly one
-wins. Object stores give the same guarantee with conditional PUTs.
+The log needs one thing from storage: create a file only if it isn't there
+yet. Locally that's a temp file plus `os.link()`, which fails when the name is
+taken. S3 has conditional PUTs for the same job. Readers never see a
+half-written commit, and only one of two writers can win a given version.
 
-### Concurrency (`tinylake/table.py`)
+### Concurrent writers (`table.py`)
 
-Writers are optimistic. A transaction reads the latest snapshot, does all of
-its work (writing new Parquet files and deciding which old ones to remove),
-then tries to create the next commit. If it loses that race, it reads the
-winner's commit and decides whether its own changes still make sense on top:
+Nobody locks. A writer reads the latest version, writes its Parquet files,
+then tries to create the next commit. If it loses, it reads the commit that
+beat it:
 
-- If the winner changed the schema, that's a conflict.
-- If the winner removed a file this transaction read or wants to remove,
-  that's a conflict. That covers two deletes of the same rows, or a delete
-  racing a compaction of the files it was rewriting.
-- If the winner only added files, there's no conflict. The loser retries at
-  the next version without redoing any work.
+- Schema changed: conflict.
+- A file this writer read or wanted to remove got removed: conflict. That
+  catches two deletes on the same rows, and a delete racing a compaction.
+- The other commit only added files: retry at the next version. No work is
+  redone.
 
-This is a simplified version of Delta Lake's WriteSerializable isolation.
-Blind appends never conflict, so many processes can append at once. One test
-runs 8 processes making 120 commits together, and every row lands exactly
-once. A delete that loses a race to an append is ordered after it, so the
-appended rows survive, which is the documented trade-off of that isolation
-level.
+Failed writers raise `ConcurrentModificationError`. Their Parquet files are
+left behind with no commit pointing at them, and `vacuum()` deletes them.
 
-On a conflict the transaction raises `ConcurrentModificationError`. Its new
-Parquet files are left as orphans with no commit pointing at them, which is
-harmless. `vacuum()` cleans them up.
+This is a cut-down version of Delta's WriteSerializable isolation. Appends
+never conflict with each other, so lots of processes can append at once. One
+test runs 8 processes making 120 commits together and checks every row lands
+exactly once. Heads up: a delete that loses a race to an append gets ordered
+after it, so the appended rows don't get deleted. Delta does this on purpose
+too.
 
-### Reads and data skipping (`tinylake/predicate.py`)
+### File skipping (`predicate.py`)
 
-Predicates are conjunctions of `(column, op, value)`. Each `add` action
-carries min/max stats, so a scan first throws away every file whose ranges
-prove it can't match, then filters rows inside the files that remain. Rows
-where the predicate is null (null inputs) never match, and a delete keeps
-them.
+A filter is a list of `(column, op, value)` that all have to hold. Before
+opening a file, the scan checks its min/max and skips it if no row could
+match. Rows where the filter hits a null never match, and deletes keep them.
 
-### Compaction and Z-order (`tinylake/zorder.py`)
+### Compaction and Z-order (`zorder.py`)
 
-`optimize()` merges files smaller than `target_rows`. With `zorder_by`, it
-rewrites every file in Z-order (Morton order) on those columns. Each column
-is replaced by its rank, scaled to a fixed number of bits, and the bits of
-all the columns are interleaved, so rows close in every column end up close
-together. Rewritten files are marked `dataChange: false`, since the rows are
-the same and only the layout changed.
+`optimize()` merges files smaller than `target_rows`. Pass `zorder_by` and it
+rewrites everything in Z-order on those columns: each column becomes its rank,
+the bits get interleaved, and rows that are close in all the columns end up in
+the same files. Rewritten files are marked `dataChange: false` since the rows
+didn't change, only where they live.
 
-## Results
+## Benchmark
 
-`python bench/skipping.py` writes 2M rows with uniform random `x` and `y`
-into 200 files in arrival order. It then rewrites the table sorted by `x`,
-then Z-ordered on `(x, y)`. All three layouts stay readable through time
-travel, so the same 50 random queries run against each. Each range covers 1%
-of its column. Measured on an Apple M3, seed 7:
+`python bench/skipping.py` writes 2M rows with random `x` and `y` into 200
+files, then rewrites them sorted by `x`, then Z-ordered on `(x, y)`. Time
+travel keeps all three layouts around, so the same 50 random queries run on
+each. Every range covers 1% of its column. Apple M3, seed 7:
 
 | Layout | Query | Files read (mean) | Rows returned (mean) | Scan ms (median) |
 |---|---|---|---|---|
@@ -121,26 +113,20 @@ of its column. Measured on an Apple M3, seed 7:
 | Z-order (x, y) | y in 1% range | 21.3 / 200 | 19,985 | 8.4 |
 | Z-order (x, y) | x and y in 1% ranges | 3.2 / 200 | 201 | 2.7 |
 
-What the numbers say:
+What I took from it:
 
-- In arrival order, every file spans almost the whole domain of every column,
-  so min/max stats skip nothing. Every query reads all 200 files.
-- Sorting by `x` is the best layout for any query that filters on `x`: 3
-  files instead of 200, about 25x faster. It does nothing at all for a query
-  that filters only on `y`.
-- Z-order gives up some of the `x` win (31 files instead of 3) to make `y`
-  queries 10x cheaper as well. It is the layout to pick when you don't know
-  which column the next query will filter on.
-- For the two-column query, Z-order did not beat a plain sort here. The 1%
-  range on `x` alone already narrows a sorted table to 3 files, so there was
-  nothing left to win. Z-order pays off when each filter on its own is too
-  wide to prune much.
+- Arrival order skips nothing. Every file has a bit of everything, so the
+  stats can't rule any of them out.
+- Sorting by `x` cuts `x` queries from 200 files to 3, about 25x faster, and
+  doesn't help `y` queries at all.
+- Z-order is the compromise: 31 files for `x`, 21 for `y`.
+- I expected Z-order to win the two-column query. It tied with the sort,
+  because the `x` range alone already gets a sorted table down to 3 files.
+  Z-order is worth it when you can't predict which column people filter on.
 
-## Not included
+## Missing
 
-- Partitioning, schema evolution, column mapping, deletion vectors, MERGE.
-- Stats are only min/max; no null counts, no bloom filters.
-- A single directory on one filesystem. The commit protocol assumes atomic
-  put-if-absent, which a local disk and S3 conditional writes both provide,
-  but there is no object-store backend here.
-- Supported column types: int32, int64, float, double, string, bool.
+- Partitioning, schema evolution, MERGE, deletion vectors
+- Stats beyond min/max (no null counts, no bloom filters)
+- An object store backend. It's one local folder.
+- Types other than int32, int64, float, double, string and bool
