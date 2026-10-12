@@ -1,0 +1,16 @@
+[project]
+name = "tinylake"
+version = "0.1.0"
+description = "A small ACID table format on Parquet: transaction log, optimistic concurrency, time travel, compaction, Z-order"
+requires-python = ">=3.10"
+dependencies = ["pyarrow>=14", "numpy>=1.24"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tinylake"]
